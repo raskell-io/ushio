@@ -452,3 +452,205 @@ mod diff_engine {
         assert!(summary.diffs.is_empty());
     }
 }
+
+mod new_features {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn replay_computes_body_hash() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/hash"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("hello world"))
+            .mount(&mock_server)
+            .await;
+
+        let requests = vec![ushio::capture::CapturedRequest {
+            method: "GET".to_string(),
+            url: "https://example.com/hash".to_string(),
+            headers: vec![],
+            body: None,
+            expected_status: Some(200),
+        }];
+
+        let config = ushio::replay::ReplayConfig::default();
+        let session = ushio::replay::replay(&requests, &mock_server.uri(), config)
+            .await
+            .unwrap();
+
+        assert!(session.results[0].body_hash.is_some());
+        // SHA256 of "hello world"
+        let hash = session.results[0].body_hash.as_ref().unwrap();
+        assert_eq!(hash.len(), 64); // hex-encoded SHA256
+    }
+
+    #[tokio::test]
+    async fn replay_hash_differs_when_body_differs() {
+        let server_a = MockServer::start().await;
+        let server_b = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/data"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("version-a"))
+            .mount(&server_a)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/data"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("version-b"))
+            .mount(&server_b)
+            .await;
+
+        let requests = vec![ushio::capture::CapturedRequest {
+            method: "GET".to_string(),
+            url: "https://example.com/data".to_string(),
+            headers: vec![],
+            body: None,
+            expected_status: Some(200),
+        }];
+
+        let config = ushio::replay::ReplayConfig::default();
+        let sa = ushio::replay::replay(&requests, &server_a.uri(), config.clone())
+            .await
+            .unwrap();
+        let sb = ushio::replay::replay(&requests, &server_b.uri(), config)
+            .await
+            .unwrap();
+
+        assert_ne!(sa.results[0].body_hash, sb.results[0].body_hash);
+    }
+
+    #[tokio::test]
+    async fn error_kind_is_populated_on_failure() {
+        // Connect to a port that nothing is listening on
+        let requests = vec![ushio::capture::CapturedRequest {
+            method: "GET".to_string(),
+            url: "https://127.0.0.1:1/fail".to_string(),
+            headers: vec![],
+            body: None,
+            expected_status: Some(200),
+        }];
+
+        let mut config = ushio::replay::ReplayConfig::default();
+        config.timeout = std::time::Duration::from_secs(2);
+        let session = ushio::replay::replay(&requests, "https://127.0.0.1:1", config)
+            .await
+            .unwrap();
+
+        assert!(session.results[0].error.is_some());
+        assert!(session.results[0].error_kind.is_some());
+    }
+
+    #[tokio::test]
+    async fn session_metadata_is_populated() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/meta"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let requests = vec![ushio::capture::CapturedRequest {
+            method: "GET".to_string(),
+            url: "https://example.com/meta".to_string(),
+            headers: vec![],
+            body: None,
+            expected_status: Some(200),
+        }];
+
+        let mut config = ushio::replay::ReplayConfig::default();
+        config.capture_source = Some("test.har".to_string());
+        let session = ushio::replay::replay(&requests, &mock_server.uri(), config)
+            .await
+            .unwrap();
+
+        assert_eq!(session.meta.ushio_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(session.meta.capture_source.as_deref(), Some("test.har"));
+    }
+
+    #[tokio::test]
+    async fn junit_output_is_valid_xml() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/ok"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/fail"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        let requests = vec![
+            ushio::capture::CapturedRequest {
+                method: "GET".to_string(),
+                url: "https://example.com/ok".to_string(),
+                headers: vec![],
+                body: None,
+                expected_status: Some(200),
+            },
+            ushio::capture::CapturedRequest {
+                method: "GET".to_string(),
+                url: "https://example.com/fail".to_string(),
+                headers: vec![],
+                body: None,
+                expected_status: Some(200),
+            },
+        ];
+
+        let config = ushio::replay::ReplayConfig::default();
+        let session = ushio::replay::replay(&requests, &mock_server.uri(), config)
+            .await
+            .unwrap();
+
+        let junit = ushio::output::print_replay_junit(&session);
+        assert!(junit.starts_with("<?xml"));
+        assert!(junit.contains("<testsuite"));
+        assert!(junit.contains("<testcase"));
+        assert!(junit.contains("<failure"));
+        assert!(junit.contains("</testsuite>"));
+    }
+
+    #[tokio::test]
+    async fn fetch_remote_capture_from_mock() {
+        let mock_server = MockServer::start().await;
+
+        let capture_json = serde_json::json!({
+            "version": "1.0",
+            "source": "remote-test",
+            "requests": [
+                {
+                    "method": "GET",
+                    "url": "https://example.com/test",
+                    "headers": [],
+                    "body": null,
+                    "expected_status": 200
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/api/logs"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(capture_json.to_string())
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let url = format!("{}/api/logs", mock_server.uri());
+        let requests = ushio::proxy::fetch_remote_capture(&url, false)
+            .await
+            .unwrap();
+
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "GET");
+    }
+}

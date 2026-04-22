@@ -1,6 +1,6 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use std::io::IsTerminal;
+use clap::{CommandFactory, Parser, Subcommand};
+use std::io::{IsTerminal, Read as _};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -84,6 +84,14 @@ enum Command {
         /// Replay only a range of requests (e.g. "0-9", "5-", "-10")
         #[arg(long)]
         range: Option<String>,
+
+        /// HTTP/SOCKS proxy URL (e.g. "http://proxy:8080" or "socks5://proxy:1080")
+        #[arg(long)]
+        proxy: Option<String>,
+
+        /// Exit with code 2 if any status mismatches are detected (for CI)
+        #[arg(long, default_value = "false")]
+        assert_no_mismatch: bool,
     },
 
     /// Compare replay results between two targets
@@ -103,13 +111,43 @@ enum Command {
 
     /// Convert HAR file to ushio capture format
     Convert {
-        /// Input HAR file
+        /// Input HAR file (use "-" for stdin)
         #[arg(required = true)]
         input: String,
 
         /// Output file (default: stdout)
         #[arg(short, long)]
         output: Option<String>,
+    },
+
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(required = true, value_enum)]
+        shell: clap_complete::Shell,
+    },
+
+    /// Capture traffic via reverse proxy or fetch from remote
+    Capture {
+        /// Listen address for reverse proxy mode (e.g. "0.0.0.0:8080")
+        #[arg(long, required_unless_present = "from_url")]
+        listen: Option<String>,
+
+        /// Target URL to proxy requests to
+        #[arg(long, required_unless_present = "from_url")]
+        target: Option<String>,
+
+        /// Fetch request logs from a remote URL (Sentinel or compatible endpoint)
+        #[arg(long, required_unless_present = "listen")]
+        from_url: Option<String>,
+
+        /// Output file (default: stdout)
+        #[arg(short, long)]
+        output: Option<String>,
+
+        /// Accept invalid TLS certificates
+        #[arg(long, default_value = "false")]
+        insecure: bool,
     },
 }
 
@@ -118,6 +156,7 @@ enum OutputFormat {
     Pretty,
     Json,
     Compact,
+    Junit,
 }
 
 #[tokio::main]
@@ -149,6 +188,8 @@ async fn main() -> Result<()> {
             filter,
             method,
             range,
+            proxy,
+            assert_no_mismatch,
         } => {
             // Load capture (try as ushio format first, then HAR)
             let mut requests = load_capture_or_har(&capture)?;
@@ -194,6 +235,7 @@ async fn main() -> Result<()> {
                 delay_ms: delay,
                 insecure,
                 capture_source: Some(capture.clone()),
+                proxy: proxy.clone(),
             };
 
             // Replay against each target
@@ -234,6 +276,9 @@ async fn main() -> Result<()> {
                     OutputFormat::Compact => {
                         println!("{}", output::print_replay_compact(&session));
                     }
+                    OutputFormat::Junit => {
+                        print!("{}", output::print_replay_junit(&session));
+                    }
                 }
 
                 // Save to file if requested
@@ -247,6 +292,15 @@ async fn main() -> Result<()> {
                     };
                     replay::save_session(&session, &output_path)?;
                     eprintln!("Saved results to {}", output_path);
+                }
+
+                // Assert mode for CI
+                if assert_no_mismatch && session.status_mismatches > 0 {
+                    eprintln!(
+                        "Assertion failed: {} status mismatch(es) detected",
+                        session.status_mismatches
+                    );
+                    std::process::exit(2);
                 }
             }
         }
@@ -274,6 +328,9 @@ async fn main() -> Result<()> {
                 OutputFormat::Compact => {
                     println!("{}", output::print_diff_compact(&summary));
                 }
+                OutputFormat::Junit => {
+                    print!("{}", output::print_diff_junit(&summary));
+                }
             }
 
             // Exit with code 1 if there are differences
@@ -283,9 +340,18 @@ async fn main() -> Result<()> {
         }
 
         Command::Convert { input, output } => {
-            // Read HAR file
-            let content = std::fs::read_to_string(&input)
-                .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", input, e))?;
+            // Read HAR file (stdin or file)
+            let (content, source) = if input == "-" {
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| anyhow::anyhow!("Failed to read stdin: {}", e))?;
+                (buf, "stdin".to_string())
+            } else {
+                let c = std::fs::read_to_string(&input)
+                    .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", input, e))?;
+                (c, input.clone())
+            };
 
             // Parse HAR
             let har_data = har::parse_har(&content)
@@ -293,7 +359,7 @@ async fn main() -> Result<()> {
 
             // Convert to capture format
             let requests = har::har_to_capture(har_data);
-            let capture_data = capture::Capture::new(requests).with_source(input.clone());
+            let capture_data = capture::Capture::new(requests).with_source(source);
 
             // Output
             let json = serde_json::to_string_pretty(&capture_data)?;
@@ -309,6 +375,46 @@ async fn main() -> Result<()> {
                 None => {
                     println!("{}", json);
                 }
+            }
+        }
+
+        Command::Completions { shell } => {
+            clap_complete::generate(shell, &mut Args::command(), "ushio", &mut std::io::stdout());
+        }
+
+        Command::Capture {
+            listen,
+            target,
+            from_url,
+            output,
+            insecure,
+        } => {
+            if let Some(url) = from_url {
+                // Fetch mode: pull request logs from a remote endpoint
+                let requests = ushio::proxy::fetch_remote_capture(&url, insecure).await?;
+                let capture_data =
+                    capture::Capture::new(requests).with_source(format!("remote:{}", url));
+                let json = serde_json::to_string_pretty(&capture_data)?;
+                match output {
+                    Some(path) => {
+                        std::fs::write(&path, &json)?;
+                        eprintln!(
+                            "Fetched {} requests to {}",
+                            capture_data.requests.len(),
+                            path
+                        );
+                    }
+                    None => {
+                        println!("{}", json);
+                    }
+                }
+            } else if let (Some(listen_addr), Some(target_url)) = (listen, target) {
+                // Proxy mode: reverse proxy that records traffic
+                let output_path = output.unwrap_or_else(|| "capture.json".to_string());
+                ushio::proxy::run_capture_proxy(&listen_addr, &target_url, &output_path, insecure)
+                    .await?;
+            } else {
+                anyhow::bail!("Either --from-url or both --listen and --target are required");
             }
         }
     }

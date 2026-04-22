@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::{Duration, Instant};
 use url::Url;
 
@@ -25,6 +26,7 @@ pub struct ReplayConfig {
     pub delay_ms: u64,
     pub insecure: bool,
     pub capture_source: Option<String>,
+    pub proxy: Option<String>,
 }
 
 impl Default for ReplayConfig {
@@ -38,8 +40,22 @@ impl Default for ReplayConfig {
             delay_ms: 0,
             insecure: false,
             capture_source: None,
+            proxy: None,
         }
     }
+}
+
+/// Category of error that occurred during replay
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorKind {
+    Timeout,
+    Dns,
+    Connect,
+    Tls,
+    Request,
+    Response,
+    Unknown,
 }
 
 /// Result of replaying a single request
@@ -51,11 +67,13 @@ pub struct ReplayResult {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
+    pub body_hash: Option<String>,
     pub body_size: usize,
     pub duration_ms: u64,
     pub expected_status: Option<u16>,
     pub status_match: bool,
     pub error: Option<String>,
+    pub error_kind: Option<ErrorKind>,
 }
 
 /// Metadata about how a replay was executed
@@ -109,6 +127,11 @@ pub async fn replay_with_progress(
 
     if config.insecure {
         client_builder = client_builder.danger_accept_invalid_certs(true);
+    }
+
+    if let Some(ref proxy_url) = config.proxy {
+        let proxy = reqwest::Proxy::all(proxy_url).context("Invalid proxy URL")?;
+        client_builder = client_builder.proxy(proxy);
     }
 
     let client = client_builder
@@ -185,6 +208,29 @@ pub async fn replay_with_progress(
     })
 }
 
+/// Classify an error into an ErrorKind
+fn classify_error(err: &anyhow::Error) -> ErrorKind {
+    let msg = err.to_string().to_lowercase();
+    if msg.contains("timed out") || msg.contains("timeout") {
+        ErrorKind::Timeout
+    } else if msg.contains("dns") || msg.contains("resolve") || msg.contains("no such host") {
+        ErrorKind::Dns
+    } else if msg.contains("ssl") || msg.contains("tls") || msg.contains("certificate") {
+        ErrorKind::Tls
+    } else if msg.contains("connect")
+        || msg.contains("connection refused")
+        || msg.contains("connection reset")
+    {
+        ErrorKind::Connect
+    } else if msg.contains("request") {
+        ErrorKind::Request
+    } else if msg.contains("response") || msg.contains("body") {
+        ErrorKind::Response
+    } else {
+        ErrorKind::Unknown
+    }
+}
+
 /// Replay a single request, converting errors into a ReplayResult
 async fn replay_single_or_error(
     client: &reqwest::Client,
@@ -195,19 +241,24 @@ async fn replay_single_or_error(
 ) -> ReplayResult {
     match replay_single(client, request, index, target_url, config).await {
         Ok(result) => result,
-        Err(e) => ReplayResult {
-            request_index: index,
-            method: request.method.clone(),
-            url: rewrite_url(&request.url, target_url).unwrap_or_else(|_| request.url.clone()),
-            status: 0,
-            headers: vec![],
-            body: None,
-            body_size: 0,
-            duration_ms: 0,
-            expected_status: request.expected_status,
-            status_match: false,
-            error: Some(e.to_string()),
-        },
+        Err(e) => {
+            let error_kind = classify_error(&e);
+            ReplayResult {
+                request_index: index,
+                method: request.method.clone(),
+                url: rewrite_url(&request.url, target_url).unwrap_or_else(|_| request.url.clone()),
+                status: 0,
+                headers: vec![],
+                body: None,
+                body_hash: None,
+                body_size: 0,
+                duration_ms: 0,
+                expected_status: request.expected_status,
+                status_match: false,
+                error: Some(e.to_string()),
+                error_kind: Some(error_kind),
+            }
+        }
     }
 }
 
@@ -257,6 +308,14 @@ async fn replay_single(
         .context("Failed to read response body")?;
     let body_size = body_bytes.len();
 
+    // Always compute hash for comparison even when body capture is off
+    let body_hash = if !body_bytes.is_empty() {
+        let hash = Sha256::digest(&body_bytes);
+        Some(format!("{:x}", hash))
+    } else {
+        None
+    };
+
     let body = if config.capture_body && body_size <= MAX_BODY_CAPTURE {
         String::from_utf8(body_bytes.to_vec()).ok()
     } else {
@@ -275,11 +334,13 @@ async fn replay_single(
         status,
         headers: response_headers,
         body,
+        body_hash,
         body_size,
         duration_ms: duration.as_millis() as u64,
         expected_status: request.expected_status,
         status_match,
         error: None,
+        error_kind: None,
     })
 }
 

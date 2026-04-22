@@ -296,6 +296,126 @@ pub fn print_diff_compact(summary: &DiffSummary) -> String {
     )
 }
 
+/// Print replay session as JUnit XML for CI integration
+pub fn print_replay_junit(session: &ReplaySession) -> String {
+    let mut xml = String::new();
+    xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+
+    let failures = session
+        .results
+        .iter()
+        .filter(|r| !r.status_match || r.error.is_some())
+        .count();
+
+    xml.push_str(&format!(
+        "<testsuite name=\"ushio-replay\" tests=\"{}\" failures=\"{}\" target=\"{}\" timestamp=\"{}\">\n",
+        session.total_requests,
+        failures,
+        xml_escape(&session.target),
+        session.timestamp.format("%Y-%m-%dT%H:%M:%SZ")
+    ));
+
+    for result in &session.results {
+        let name = format!("{} {}", result.method, result.url);
+        xml.push_str(&format!(
+            "  <testcase name=\"{}\" time=\"{:.3}\"",
+            xml_escape(&name),
+            result.duration_ms as f64 / 1000.0
+        ));
+
+        if let Some(ref error) = result.error {
+            xml.push_str(">\n");
+            xml.push_str(&format!(
+                "    <error message=\"{}\" type=\"{}\"/>\n",
+                xml_escape(error),
+                result
+                    .error_kind
+                    .as_ref()
+                    .map(|k| format!("{:?}", k))
+                    .unwrap_or_else(|| "Unknown".to_string())
+            ));
+            xml.push_str("  </testcase>\n");
+        } else if !result.status_match {
+            xml.push_str(">\n");
+            let msg = format!(
+                "Expected status {}, got {}",
+                result
+                    .expected_status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+                result.status
+            );
+            xml.push_str(&format!(
+                "    <failure message=\"{}\" type=\"StatusMismatch\"/>\n",
+                xml_escape(&msg)
+            ));
+            xml.push_str("  </testcase>\n");
+        } else {
+            xml.push_str("/>\n");
+        }
+    }
+
+    xml.push_str("</testsuite>\n");
+    xml
+}
+
+/// Print diff summary as JUnit XML
+pub fn print_diff_junit(summary: &DiffSummary) -> String {
+    let mut xml = String::new();
+    xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    xml.push_str(&format!(
+        "<testsuite name=\"ushio-diff\" tests=\"{}\" failures=\"{}\">\n",
+        summary.total_requests, summary.different
+    ));
+
+    for i in 0..summary.total_requests {
+        let diff = summary.diffs.iter().find(|d| d.request_index == i);
+        match diff {
+            Some(d) => {
+                let name = format!("{} {}", d.method, d.url);
+                xml.push_str(&format!("  <testcase name=\"{}\">\n", xml_escape(&name)));
+                let mut reasons = Vec::new();
+                if let Some(ref s) = d.status_diff {
+                    reasons.push(format!("status {} → {}", s.left, s.right));
+                }
+                if d.body_diff.is_some() {
+                    reasons.push("body differs".to_string());
+                }
+                if let Some(ref w) = d.waf_diff {
+                    let l = if w.left_blocked { "blocked" } else { "allowed" };
+                    let r = if w.right_blocked {
+                        "blocked"
+                    } else {
+                        "allowed"
+                    };
+                    reasons.push(format!("WAF {} → {}", l, r));
+                }
+                xml.push_str(&format!(
+                    "    <failure message=\"{}\" type=\"Diff\"/>\n",
+                    xml_escape(&reasons.join("; "))
+                ));
+                xml.push_str("  </testcase>\n");
+            }
+            None => {
+                // Passed — need to infer method/url from position
+                xml.push_str(&format!("  <testcase name=\"request #{}\"/>\n", i));
+            }
+        }
+    }
+
+    xml.push_str("</testsuite>\n");
+    xml
+}
+
+/// Escape XML special characters
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// Truncate a string
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() > max_len {

@@ -217,6 +217,13 @@ const MAX_DIFF_OUTPUT: usize = 8 * 1024;
 
 /// Compare response bodies between two results
 fn diff_bodies(left: &ReplayResult, right: &ReplayResult) -> Option<BodyDiff> {
+    // Fast path: if hashes match, bodies are identical
+    if let (Some(lh), Some(rh)) = (&left.body_hash, &right.body_hash) {
+        if lh == rh {
+            return None;
+        }
+    }
+
     let left_body = left.body.as_deref().unwrap_or("");
     let right_body = right.body.as_deref().unwrap_or("");
 
@@ -227,6 +234,14 @@ fn diff_bodies(left: &ReplayResult, right: &ReplayResult) -> Option<BodyDiff> {
 
     // Only diff if at least one side has a body
     if left.body.is_none() && right.body.is_none() {
+        // Hashes differ but no body text — report size-only diff
+        if left.body_hash != right.body_hash && (left.body_size > 0 || right.body_size > 0) {
+            return Some(BodyDiff {
+                left_size: left.body_size,
+                right_size: right.body_size,
+                unified_diff: "(body content not captured; hashes differ)".to_string(),
+            });
+        }
         return None;
     }
 
@@ -440,11 +455,13 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             body: body.map(|s| s.to_string()),
+            body_hash: None,
             body_size: body.map(|s| s.len()).unwrap_or(0),
             duration_ms: 100,
             expected_status: Some(200),
             status_match: status == 200,
             error: None,
+            error_kind: None,
         }
     }
 
