@@ -24,17 +24,17 @@
 </p>
 
 <p align="center">
-  <a href="#installation">Installation</a> •
-  <a href="#usage">Usage</a> •
-  <a href="#features">Features</a> •
-  <a href="#philosophy">Philosophy</a>
+  <a href="docs/getting-started.md">Getting Started</a> •
+  <a href="docs/cli-reference.md">CLI Reference</a> •
+  <a href="docs/workflows.md">Workflows</a> •
+  <a href="docs/dev/contributing.md">Contributing</a>
 </p>
 
 <hr />
 
 </div>
 
-Ushio (潮, "tide") is a traffic replay tool to understand edge and WAF behavior. Like the tide flowing in and out, Ushio replays captured traffic deterministically to compare behavior across environments.
+Ushio (潮, "tide") replays captured HTTP traffic against edge targets to compare behavioral differences. It helps operators understand WAF behavior, compare environments, and debug edge issues.
 
 It answers the questions operators dread:
 - *Why was this blocked?*
@@ -43,61 +43,48 @@ It answers the questions operators dread:
 
 ---
 
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| **HAR Support** | Replay from browser HAR exports or ushio capture format |
-| **URL Rewriting** | Replay prod traffic against staging transparently |
-| **Header Mutation** | Add, replace, or remove headers for testing |
-| **Cookie Stripping** | Test without session state |
-| **WAF Detection** | Identify blocks via status codes and WAF headers |
-| **Behavioral Diff** | Compare status, headers, and WAF decisions across targets |
-
----
-
-## Installation
+## Quick start
 
 ```bash
 cargo install ushio
 ```
 
-Or build from source:
-
 ```bash
-git clone https://github.com/raskell-io/ushio.git
-cd ushio
-cargo build --release
-```
-
----
-
-## Usage
-
-```bash
-# Convert HAR to ushio format
+# Convert a browser HAR export
 ushio convert session.har -o capture.json
 
-# Replay against a target
+# Replay against staging
 ushio replay capture.json -t https://staging.example.com
 
-# Replay with header mutation
-ushio replay capture.json -t https://staging.example.com \
-  --header "Authorization:Bearer test-token"
-
-# Save results to file
+# Compare staging vs prod
 ushio replay capture.json -t https://staging.example.com -o staging.json
-
-# Compare two replay results
+ushio replay capture.json -t https://prod.example.com -o prod.json
 ushio diff staging.json prod.json
-
-# Show only differences
-ushio diff staging.json prod.json --only-diff
 ```
 
 ---
 
-## Example Output
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| **HAR + capture formats** | Replay from browser HAR exports or ushio's JSON format |
+| **URL rewriting** | Replay prod traffic against staging transparently |
+| **Header mutation** | Add, replace, or remove headers per request |
+| **WAF detection** | Identify blocks via status codes, headers, and body patterns |
+| **Body diff** | Unified text diff of response bodies with SHA256 hashing |
+| **Behavioral diff** | Compare status, headers, body, and WAF decisions across targets |
+| **Concurrent replay** | Ordered results with configurable in-flight concurrency |
+| **Rate limiting** | Per-request delay for safe production replay |
+| **Capture proxy** | Built-in reverse proxy that records traffic |
+| **Remote fetch** | Pull request logs from Sentinel or compatible endpoints |
+| **CI integration** | JUnit XML output, assertion mode with exit codes |
+| **Proxy support** | Route through HTTP or SOCKS proxies |
+| **Shell completions** | Bash, Zsh, Fish, Elvish, PowerShell |
+
+---
+
+## Example output
 
 ### Replay
 ```
@@ -152,55 +139,39 @@ ushio diff results
 
 ---
 
-## Example Workflow
+## Documentation
 
-### Debugging a WAF block
-```bash
-# 1. Export HAR from browser (when request worked)
-# 2. Convert to ushio format
-ushio convert working-session.har -o capture.json
+### User guides
+- [Getting Started](docs/getting-started.md) — Installation, first steps
+- [CLI Reference](docs/cli-reference.md) — All commands, flags, and exit codes
+- [Workflows](docs/workflows.md) — Debugging WAF blocks, CI integration, recording traffic
+- [Capture Format](docs/capture-format.md) — JSON format specification
+- [WAF Detection](docs/waf-detection.md) — How blocking is detected, supported vendors
 
-# 3. Replay against staging (where it's blocked)
-ushio replay capture.json -t https://staging.example.com
-```
-
-### Comparing environments
-```bash
-# Replay same capture against two environments
-ushio replay capture.json -t https://staging.example.com -o staging.json
-ushio replay capture.json -t https://prod.example.com -o prod.json
-
-# Diff the results
-ushio diff staging.json prod.json --only-diff
-```
+### Developer guides
+- [Architecture](docs/dev/architecture.md) — Module overview, data flow, design decisions
+- [Contributing](docs/dev/contributing.md) — Building, testing, adding features
+- [Testing](docs/dev/testing.md) — Test strategy, fixtures, writing tests
 
 ---
 
-## Philosophy
+## Exit codes
 
-- **Reproducible truth** for edge security behavior
-- **Bridges operators, security, and developers**
-- **Eliminates guesswork** and politics
-- **Safe to run** against production (read-only replay)
-- **Foundation for AI-assisted** WAF analysis
-
----
-
-## Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | Success (replay complete, or diff found no differences) |
-| 1 | Differences found (diff command only) |
+| Code | Context | Meaning |
+|------|---------|---------|
+| 0 | `replay` | All requests completed, no mismatches (or `--assert-no-mismatch` not set) |
+| 0 | `diff` | No differences found |
+| 1 | `diff` | Differences detected |
+| 2 | `replay` | Status mismatches detected (with `--assert-no-mismatch`) |
 
 ---
 
-## Part of the Raskell.io Family
+## Part of the Raskell.io family
 
-Ushio is part of the [raskell.io](https://raskell.io) ecosystem, alongside:
-- [Sentinel](https://sentinel.raskell.io) - Security-first reverse proxy built on Pingora
-- [Sango](https://github.com/raskell-io/sango) - Operator-grade edge diagnostics
-- [Tanuki](https://tanuki.raskell.io) - Agent registry
+Ushio is part of the [raskell.io](https://raskell.io) ecosystem:
+- [Sentinel](https://sentinel.raskell.io) — Security-first reverse proxy built on Pingora
+- [Sango](https://github.com/raskell-io/sango) — Operator-grade edge diagnostics
+- [Tanuki](https://tanuki.raskell.io) — Agent registry
 
 ---
 
