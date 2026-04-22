@@ -4,17 +4,13 @@
 
 use colored::Colorize;
 
-use crate::diff::{DiffSummary, HeaderDiffType, RequestDiff};
+use crate::diff::{BodyDiff, DiffSummary, HeaderDiffType, RequestDiff};
 use crate::replay::ReplaySession;
 
 /// Print replay session in pretty format
 pub fn print_replay_pretty(session: &ReplaySession) {
     println!();
-    println!(
-        "{} {}",
-        "ushio".bold().cyan(),
-        "traffic replay".dimmed()
-    );
+    println!("{} {}", "ushio".bold().cyan(), "traffic replay".dimmed());
     println!("{}", "─".repeat(60).dimmed());
     println!();
 
@@ -84,11 +80,7 @@ pub fn print_replay_pretty(session: &ReplaySession) {
                     .expected_status
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "?".to_string());
-                println!(
-                    "      Expected: {}, Got: {}",
-                    expected.green(),
-                    status_str
-                );
+                println!("      Expected: {}, Got: {}", expected.green(), status_str);
             }
             println!();
         }
@@ -100,11 +92,7 @@ pub fn print_replay_pretty(session: &ReplaySession) {
 /// Print diff summary in pretty format
 pub fn print_diff_pretty(summary: &DiffSummary, only_diff: bool) {
     println!();
-    println!(
-        "{} {}",
-        "ushio".bold().cyan(),
-        "diff results".dimmed()
-    );
+    println!("{} {}", "ushio".bold().cyan(), "diff results".dimmed());
     println!("{}", "─".repeat(60).dimmed());
     println!();
 
@@ -125,6 +113,13 @@ pub fn print_diff_pretty(summary: &DiffSummary, only_diff: bool) {
             "  {} {}",
             "Different:".bold(),
             summary.different.to_string().yellow()
+        );
+    }
+    if summary.body_diffs > 0 {
+        println!(
+            "  {} {}",
+            "Body diffs:".bold(),
+            summary.body_diffs.to_string().yellow()
         );
     }
     if summary.waf_diffs > 0 {
@@ -190,6 +185,11 @@ fn print_request_diff(diff: &RequestDiff) {
         }
     }
 
+    // Body diff
+    if let Some(ref body) = diff.body_diff {
+        print_body_diff(body);
+    }
+
     // Header diffs
     for header in &diff.header_diffs {
         let change = match header.diff_type {
@@ -211,6 +211,25 @@ fn print_request_diff(diff: &RequestDiff) {
     }
 
     println!();
+}
+
+/// Print body diff with colored unified output
+fn print_body_diff(body: &BodyDiff) {
+    println!(
+        "      {} {} bytes → {} bytes",
+        "Body:".dimmed(),
+        body.left_size,
+        body.right_size
+    );
+    for line in body.unified_diff.lines().take(20) {
+        if let Some(rest) = line.strip_prefix('+') {
+            println!("        {}", format!("+{}", rest).green());
+        } else if let Some(rest) = line.strip_prefix('-') {
+            println!("        {}", format!("-{}", rest).red());
+        } else {
+            // context line — skip to keep output focused
+        }
+    }
 }
 
 /// Format status code with color
@@ -240,7 +259,10 @@ pub fn print_diff_json(summary: &DiffSummary) -> String {
 
 /// Print replay session in compact format
 pub fn print_replay_compact(session: &ReplaySession) -> String {
-    let mut parts = vec![format!("{}: {}/{}", session.target, session.successful, session.total_requests)];
+    let mut parts = vec![format!(
+        "{}: {}/{}",
+        session.target, session.successful, session.total_requests
+    )];
 
     if session.failed > 0 {
         parts.push(format!("failed={}", session.failed));
@@ -263,12 +285,13 @@ pub fn print_diff_compact(summary: &DiffSummary) -> String {
     };
 
     format!(
-        "{} vs {}: {} identical={} different={} waf={}",
+        "{} vs {}: {} identical={} different={} body={} waf={}",
         summary.left_target,
         summary.right_target,
         status,
         summary.identical,
         summary.different,
+        summary.body_diffs,
         summary.waf_diffs
     )
 }

@@ -6,12 +6,16 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// HAR 1.2 root structure
+///
+/// These structs model the full HAR 1.2 spec. Not all fields are consumed
+/// by the conversion logic, but they must be present for deserialization.
 #[derive(Debug, Deserialize)]
 pub struct Har {
     pub log: HarLog,
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct HarLog {
     pub version: String,
     pub creator: HarCreator,
@@ -19,6 +23,7 @@ pub struct HarLog {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct HarCreator {
     pub name: String,
     pub version: String,
@@ -26,6 +31,7 @@ pub struct HarCreator {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct HarEntry {
     pub started_date_time: String,
     pub request: HarRequest,
@@ -35,6 +41,7 @@ pub struct HarEntry {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct HarRequest {
     pub method: String,
     pub url: String,
@@ -45,6 +52,7 @@ pub struct HarRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct HarResponse {
     pub status: u16,
     #[serde(rename = "statusText")]
@@ -59,6 +67,7 @@ pub struct HarHeader {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct HarQueryParam {
     pub name: String,
     pub value: String,
@@ -66,6 +75,7 @@ pub struct HarQueryParam {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct HarPostData {
     pub mime_type: String,
     pub text: Option<String>,

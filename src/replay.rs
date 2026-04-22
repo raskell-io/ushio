@@ -3,12 +3,16 @@
 //! Replays captured requests against target endpoints in deterministic order.
 
 use anyhow::{Context, Result};
+use futures::stream::{self, StreamExt};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::capture::CapturedRequest;
+
+/// Maximum response body size to capture (256 KB)
+const MAX_BODY_CAPTURE: usize = 256 * 1024;
 
 /// Configuration for replay execution
 #[derive(Debug, Clone)]
@@ -17,6 +21,10 @@ pub struct ReplayConfig {
     pub concurrency: usize,
     pub header_mutations: Vec<(String, String)>,
     pub strip_cookies: bool,
+    pub capture_body: bool,
+    pub delay_ms: u64,
+    pub insecure: bool,
+    pub capture_source: Option<String>,
 }
 
 impl Default for ReplayConfig {
@@ -26,6 +34,10 @@ impl Default for ReplayConfig {
             concurrency: 1,
             header_mutations: vec![],
             strip_cookies: false,
+            capture_body: true,
+            delay_ms: 0,
+            insecure: false,
+            capture_source: None,
         }
     }
 }
@@ -38,6 +50,7 @@ pub struct ReplayResult {
     pub url: String,
     pub status: u16,
     pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
     pub body_size: usize,
     pub duration_ms: u64,
     pub expected_status: Option<u16>,
@@ -45,11 +58,22 @@ pub struct ReplayResult {
     pub error: Option<String>,
 }
 
+/// Metadata about how a replay was executed
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayMeta {
+    pub ushio_version: String,
+    pub capture_source: Option<String>,
+    pub timeout_secs: u64,
+    pub concurrency: usize,
+    pub insecure: bool,
+}
+
 /// Result of a complete replay session
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReplaySession {
     pub target: String,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub meta: ReplayMeta,
     pub total_requests: usize,
     pub successful: usize,
     pub failed: usize,
@@ -57,69 +81,134 @@ pub struct ReplaySession {
     pub results: Vec<ReplayResult>,
 }
 
+/// Progress callback: (total_requests, completed_result)
+pub type ProgressFn = Box<dyn Fn(usize, &ReplayResult) + Send + Sync>;
+
 /// Replay a set of requests against a target
 pub async fn replay(
     requests: &[CapturedRequest],
     target: &str,
     config: ReplayConfig,
 ) -> Result<ReplaySession> {
+    replay_with_progress(requests, target, config, None).await
+}
+
+/// Replay with an optional progress callback
+pub async fn replay_with_progress(
+    requests: &[CapturedRequest],
+    target: &str,
+    config: ReplayConfig,
+    progress: Option<ProgressFn>,
+) -> Result<ReplaySession> {
     let target_url = Url::parse(target).context("Invalid target URL")?;
 
     // Build HTTP client
-    let client = reqwest::Client::builder()
+    let mut client_builder = reqwest::Client::builder()
         .timeout(config.timeout)
-        .redirect(reqwest::redirect::Policy::none()) // Don't follow redirects
+        .redirect(reqwest::redirect::Policy::none()); // Don't follow redirects
+
+    if config.insecure {
+        client_builder = client_builder.danger_accept_invalid_certs(true);
+    }
+
+    let client = client_builder
         .build()
         .context("Failed to build HTTP client")?;
 
-    let mut results = Vec::with_capacity(requests.len());
+    let raw_results = if config.concurrency > 1 {
+        // Concurrent replay with ordered results via buffered()
+        let target_url_ref = &target_url;
+        let client_ref = &client;
+        let config_ref = &config;
+
+        stream::iter(
+            requests
+                .iter()
+                .enumerate()
+                .map(|(index, request)| async move {
+                    replay_single_or_error(client_ref, request, index, target_url_ref, config_ref)
+                        .await
+                }),
+        )
+        .buffered(config.concurrency)
+        .collect::<Vec<_>>()
+        .await
+    } else {
+        // Sequential replay with delay support
+        let mut results = Vec::with_capacity(requests.len());
+        for (index, request) in requests.iter().enumerate() {
+            if index > 0 && config.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(config.delay_ms)).await;
+            }
+            results
+                .push(replay_single_or_error(&client, request, index, &target_url, &config).await);
+        }
+        results
+    };
+
+    let mut results = Vec::with_capacity(raw_results.len());
     let mut successful = 0;
     let mut failed = 0;
     let mut status_mismatches = 0;
 
-    // Process requests sequentially for determinism
-    for (index, request) in requests.iter().enumerate() {
-        let result = replay_single(&client, request, index, &target_url, &config).await;
-
-        match &result {
-            Ok(r) => {
-                if r.error.is_some() {
-                    failed += 1;
-                } else {
-                    successful += 1;
-                    if !r.status_match {
-                        status_mismatches += 1;
-                    }
-                }
-            }
-            Err(_) => {
-                failed += 1;
+    let total = raw_results.len();
+    for result in raw_results {
+        if result.error.is_some() {
+            failed += 1;
+        } else {
+            successful += 1;
+            if !result.status_match {
+                status_mismatches += 1;
             }
         }
-
-        results.push(result.unwrap_or_else(|e| ReplayResult {
-            request_index: index,
-            method: request.method.clone(),
-            url: rewrite_url(&request.url, &target_url).unwrap_or_else(|_| request.url.clone()),
-            status: 0,
-            headers: vec![],
-            body_size: 0,
-            duration_ms: 0,
-            expected_status: request.expected_status,
-            status_match: false,
-            error: Some(e.to_string()),
-        }));
+        if let Some(ref cb) = progress {
+            cb(total, &result);
+        }
+        results.push(result);
     }
 
     Ok(ReplaySession {
         target: target.to_string(),
         timestamp: chrono::Utc::now(),
+        meta: ReplayMeta {
+            ushio_version: env!("CARGO_PKG_VERSION").to_string(),
+            capture_source: config.capture_source,
+            timeout_secs: config.timeout.as_secs(),
+            concurrency: config.concurrency,
+            insecure: config.insecure,
+        },
         total_requests: requests.len(),
         successful,
         failed,
         status_mismatches,
         results,
     })
+}
+
+/// Replay a single request, converting errors into a ReplayResult
+async fn replay_single_or_error(
+    client: &reqwest::Client,
+    request: &CapturedRequest,
+    index: usize,
+    target_url: &Url,
+    config: &ReplayConfig,
+) -> ReplayResult {
+    match replay_single(client, request, index, target_url, config).await {
+        Ok(result) => result,
+        Err(e) => ReplayResult {
+            request_index: index,
+            method: request.method.clone(),
+            url: rewrite_url(&request.url, target_url).unwrap_or_else(|_| request.url.clone()),
+            status: 0,
+            headers: vec![],
+            body: None,
+            body_size: 0,
+            duration_ms: 0,
+            expected_status: request.expected_status,
+            status_match: false,
+            error: Some(e.to_string()),
+        },
+    }
 }
 
 /// Replay a single request
@@ -134,7 +223,11 @@ async fn replay_single(
     let url = rewrite_url(&request.url, target_url)?;
 
     // Build headers
-    let headers = apply_mutations(&request.headers, &config.header_mutations, config.strip_cookies);
+    let headers = apply_mutations(
+        &request.headers,
+        &config.header_mutations,
+        config.strip_cookies,
+    );
     let header_map = build_header_map(&headers)?;
 
     // Build request
@@ -158,8 +251,17 @@ async fn replay_single(
         .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
 
-    let body = response.bytes().await.context("Failed to read response body")?;
-    let body_size = body.len();
+    let body_bytes = response
+        .bytes()
+        .await
+        .context("Failed to read response body")?;
+    let body_size = body_bytes.len();
+
+    let body = if config.capture_body && body_size <= MAX_BODY_CAPTURE {
+        String::from_utf8(body_bytes.to_vec()).ok()
+    } else {
+        None
+    };
 
     let status_match = request
         .expected_status
@@ -172,6 +274,7 @@ async fn replay_single(
         url,
         status,
         headers: response_headers,
+        body,
         body_size,
         duration_ms: duration.as_millis() as u64,
         expected_status: request.expected_status,
@@ -226,7 +329,9 @@ fn apply_mutations(
             result.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
         } else {
             // Add or replace header
-            let pos = result.iter().position(|(n, _)| n.eq_ignore_ascii_case(name));
+            let pos = result
+                .iter()
+                .position(|(n, _)| n.eq_ignore_ascii_case(name));
             if let Some(idx) = pos {
                 result[idx] = (name.clone(), value.clone());
             } else {
@@ -243,7 +348,9 @@ fn build_header_map(headers: &[(String, String)]) -> Result<HeaderMap> {
     let mut map = HeaderMap::new();
 
     for (name, value) in headers {
-        let header_name: HeaderName = name.parse().context(format!("Invalid header name: {}", name))?;
+        let header_name: HeaderName = name
+            .parse()
+            .context(format!("Invalid header name: {}", name))?;
         let header_value: HeaderValue = value
             .parse()
             .context(format!("Invalid header value for {}", name))?;
@@ -291,7 +398,9 @@ mod tests {
         let mutations = vec![("Authorization".to_string(), "Bearer token".to_string())];
         let result = apply_mutations(&headers, &mutations, false);
         assert_eq!(result.len(), 2);
-        assert!(result.iter().any(|(n, v)| n == "Authorization" && v == "Bearer token"));
+        assert!(result
+            .iter()
+            .any(|(n, v)| n == "Authorization" && v == "Bearer token"));
     }
 
     #[test]

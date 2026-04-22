@@ -1,12 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::io::IsTerminal;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-mod capture;
-mod diff;
-mod har;
-mod output;
-mod replay;
+use ushio::{capture, diff, har, output, replay};
 
 #[derive(Parser, Debug)]
 #[command(name = "ushio")]
@@ -51,6 +49,10 @@ enum Command {
         #[arg(long, default_value = "30")]
         timeout: u64,
 
+        /// Number of concurrent requests (default: 1 for deterministic ordering)
+        #[arg(long, default_value = "1")]
+        concurrency: usize,
+
         /// Mutate headers (format: "Header-Name:value" or "Header-Name:" to remove)
         #[arg(long)]
         header: Vec<String>,
@@ -58,6 +60,30 @@ enum Command {
         /// Strip cookies from requests
         #[arg(long, default_value = "false")]
         strip_cookies: bool,
+
+        /// Disable response body capture (reduces memory for large replays)
+        #[arg(long, default_value = "false")]
+        no_body: bool,
+
+        /// Delay between requests in milliseconds (for rate limiting)
+        #[arg(long, default_value = "0")]
+        delay: u64,
+
+        /// Accept invalid TLS certificates (for staging with self-signed certs)
+        #[arg(long, default_value = "false")]
+        insecure: bool,
+
+        /// Filter requests by URL pattern (substring match)
+        #[arg(long)]
+        filter: Option<String>,
+
+        /// Filter requests by HTTP method (comma-separated, e.g. "GET,POST")
+        #[arg(long)]
+        method: Option<String>,
+
+        /// Replay only a range of requests (e.g. "0-9", "5-", "-10")
+        #[arg(long)]
+        range: Option<String>,
     },
 
     /// Compare replay results between two targets
@@ -100,12 +126,11 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(if args.verbose {
-                    tracing::Level::DEBUG.into()
-                } else {
-                    tracing::Level::INFO.into()
-                }),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive(if args.verbose {
+                tracing::Level::DEBUG.into()
+            } else {
+                tracing::Level::INFO.into()
+            }),
         )
         .init();
 
@@ -115,11 +140,31 @@ async fn main() -> Result<()> {
             target,
             output,
             timeout,
+            concurrency,
             header,
             strip_cookies,
+            no_body,
+            delay,
+            insecure,
+            filter,
+            method,
+            range,
         } => {
             // Load capture (try as ushio format first, then HAR)
-            let requests = load_capture_or_har(&capture)?;
+            let mut requests = load_capture_or_har(&capture)?;
+
+            // Apply request filters
+            requests = filter_requests(
+                requests,
+                filter.as_deref(),
+                method.as_deref(),
+                range.as_deref(),
+            )?;
+
+            if requests.is_empty() {
+                eprintln!("No requests match the given filters");
+                return Ok(());
+            }
 
             // Parse header mutations
             let header_mutations: Vec<(String, String)> = header
@@ -131,7 +176,10 @@ async fn main() -> Result<()> {
                     } else if parts.len() == 1 && h.ends_with(':') {
                         Some((parts[0].to_string(), String::new()))
                     } else {
-                        eprintln!("Warning: Invalid header format '{}', expected 'Name:value'", h);
+                        eprintln!(
+                            "Warning: Invalid header format '{}', expected 'Name:value'",
+                            h
+                        );
                         None
                     }
                 })
@@ -139,14 +187,41 @@ async fn main() -> Result<()> {
 
             let config = replay::ReplayConfig {
                 timeout: Duration::from_secs(timeout),
-                concurrency: 1,
+                concurrency,
                 header_mutations,
                 strip_cookies,
+                capture_body: !no_body,
+                delay_ms: delay,
+                insecure,
+                capture_source: Some(capture.clone()),
             };
 
             // Replay against each target
             for t in &target {
-                let session = replay::replay(&requests, t, config.clone()).await?;
+                // Progress callback for TTY stderr
+                let progress: Option<replay::ProgressFn> = if std::io::stderr().is_terminal() {
+                    let counter = std::sync::Arc::new(AtomicUsize::new(0));
+                    Some(Box::new(move |total, result| {
+                        let done = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        let status_str = if result.error.is_some() {
+                            "ERR".to_string()
+                        } else {
+                            result.status.to_string()
+                        };
+                        eprint!(
+                            "\r  [{}/{}] {} {} → {}    ",
+                            done, total, result.method, result.url, status_str
+                        );
+                        if done == total {
+                            eprintln!();
+                        }
+                    }))
+                } else {
+                    None
+                };
+
+                let session =
+                    replay::replay_with_progress(&requests, t, config.clone(), progress).await?;
 
                 // Output results
                 match args.format {
@@ -225,7 +300,11 @@ async fn main() -> Result<()> {
             match output {
                 Some(path) => {
                     std::fs::write(&path, &json)?;
-                    eprintln!("Converted {} requests to {}", capture_data.requests.len(), path);
+                    eprintln!(
+                        "Converted {} requests to {}",
+                        capture_data.requests.len(),
+                        path
+                    );
                 }
                 None => {
                     println!("{}", json);
@@ -256,4 +335,74 @@ fn load_capture_or_har(path: &str) -> Result<Vec<capture::CapturedRequest>> {
         "Failed to parse {} as either ushio capture or HAR format",
         path
     ))
+}
+
+/// Filter requests by URL pattern, HTTP method, and index range
+fn filter_requests(
+    requests: Vec<capture::CapturedRequest>,
+    url_filter: Option<&str>,
+    method_filter: Option<&str>,
+    range_filter: Option<&str>,
+) -> Result<Vec<capture::CapturedRequest>> {
+    let methods: Option<Vec<String>> =
+        method_filter.map(|m| m.split(',').map(|s| s.trim().to_uppercase()).collect());
+
+    let (range_start, range_end) = parse_range(range_filter, requests.len())?;
+
+    let filtered: Vec<capture::CapturedRequest> = requests
+        .into_iter()
+        .enumerate()
+        .filter(|(i, req)| {
+            // Range filter
+            if *i < range_start || *i > range_end {
+                return false;
+            }
+            // Method filter
+            if let Some(ref methods) = methods {
+                if !methods.contains(&req.method.to_uppercase()) {
+                    return false;
+                }
+            }
+            // URL substring filter
+            if let Some(pattern) = url_filter {
+                if !req.url.contains(pattern) {
+                    return false;
+                }
+            }
+            true
+        })
+        .map(|(_, req)| req)
+        .collect();
+
+    Ok(filtered)
+}
+
+/// Parse a range string like "5-10", "5-", "-10", or "5"
+fn parse_range(range: Option<&str>, total: usize) -> Result<(usize, usize)> {
+    let Some(range) = range else {
+        return Ok((0, total.saturating_sub(1)));
+    };
+
+    if let Some((start, end)) = range.split_once('-') {
+        let start: usize = if start.is_empty() {
+            0
+        } else {
+            start
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid range start: '{}'", start))?
+        };
+        let end: usize = if end.is_empty() {
+            total.saturating_sub(1)
+        } else {
+            end.parse()
+                .map_err(|_| anyhow::anyhow!("Invalid range end: '{}'", end))?
+        };
+        Ok((start, end))
+    } else {
+        // Single index
+        let idx: usize = range
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid range: '{}'", range))?;
+        Ok((idx, idx))
+    }
 }

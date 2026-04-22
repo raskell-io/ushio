@@ -1,9 +1,10 @@
 //! Behavioral diff analysis
 //!
 //! Compares replay results between two targets to identify differences
-//! in status codes, headers, and WAF decisions.
+//! in status codes, headers, body content, and WAF decisions.
 
 use serde::{Deserialize, Serialize};
+use similar::{ChangeTag, TextDiff};
 
 use crate::replay::{ReplayResult, ReplaySession};
 
@@ -15,6 +16,7 @@ pub struct RequestDiff {
     pub url: String,
     pub status_diff: Option<StatusDiff>,
     pub header_diffs: Vec<HeaderDiff>,
+    pub body_diff: Option<BodyDiff>,
     pub waf_diff: Option<WafDiff>,
 }
 
@@ -47,6 +49,14 @@ pub struct WafDiff {
     pub right_reason: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BodyDiff {
+    pub left_size: usize,
+    pub right_size: usize,
+    /// Unified diff of body content (truncated if large)
+    pub unified_diff: String,
+}
+
 /// Summary of differences between two replay sessions
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DiffSummary {
@@ -57,6 +67,7 @@ pub struct DiffSummary {
     pub different: usize,
     pub status_diffs: usize,
     pub header_diffs: usize,
+    pub body_diffs: usize,
     pub waf_diffs: usize,
     pub diffs: Vec<RequestDiff>,
 }
@@ -86,6 +97,7 @@ pub fn diff_sessions(left: &ReplaySession, right: &ReplaySession) -> DiffSummary
     let mut different = 0;
     let mut status_diffs_count = 0;
     let mut header_diffs_count = 0;
+    let mut body_diffs_count = 0;
     let mut waf_diffs_count = 0;
 
     // Match requests by index
@@ -103,6 +115,9 @@ pub fn diff_sessions(left: &ReplaySession, right: &ReplaySession) -> DiffSummary
                     }
                     if !diff.header_diffs.is_empty() {
                         header_diffs_count += 1;
+                    }
+                    if diff.body_diff.is_some() {
+                        body_diffs_count += 1;
                     }
                     if diff.waf_diff.is_some() {
                         waf_diffs_count += 1;
@@ -125,6 +140,7 @@ pub fn diff_sessions(left: &ReplaySession, right: &ReplaySession) -> DiffSummary
                         right: 0,
                     }),
                     header_diffs: vec![],
+                    body_diff: None,
                     waf_diff: None,
                 });
             }
@@ -140,6 +156,7 @@ pub fn diff_sessions(left: &ReplaySession, right: &ReplaySession) -> DiffSummary
                         right: r.status,
                     }),
                     header_diffs: vec![],
+                    body_diff: None,
                     waf_diff: None,
                 });
             }
@@ -157,6 +174,7 @@ pub fn diff_sessions(left: &ReplaySession, right: &ReplaySession) -> DiffSummary
         different,
         status_diffs: status_diffs_count,
         header_diffs: header_diffs_count,
+        body_diffs: body_diffs_count,
         waf_diffs: waf_diffs_count,
         diffs,
     }
@@ -174,10 +192,12 @@ pub fn diff_results(left: &ReplayResult, right: &ReplayResult) -> Option<Request
     };
 
     let header_diffs = diff_headers(&left.headers, &right.headers);
+    let body_diff = diff_bodies(left, right);
     let waf_diff = detect_waf_diff(left, right);
 
     // Only return a diff if there are actual differences
-    if status_diff.is_none() && header_diffs.is_empty() && waf_diff.is_none() {
+    if status_diff.is_none() && header_diffs.is_empty() && body_diff.is_none() && waf_diff.is_none()
+    {
         return None;
     }
 
@@ -187,7 +207,53 @@ pub fn diff_results(left: &ReplayResult, right: &ReplayResult) -> Option<Request
         url: left.url.clone(),
         status_diff,
         header_diffs,
+        body_diff,
         waf_diff,
+    })
+}
+
+/// Maximum unified diff output size (8 KB)
+const MAX_DIFF_OUTPUT: usize = 8 * 1024;
+
+/// Compare response bodies between two results
+fn diff_bodies(left: &ReplayResult, right: &ReplayResult) -> Option<BodyDiff> {
+    let left_body = left.body.as_deref().unwrap_or("");
+    let right_body = right.body.as_deref().unwrap_or("");
+
+    // Both empty or both missing — no diff
+    if left_body == right_body {
+        return None;
+    }
+
+    // Only diff if at least one side has a body
+    if left.body.is_none() && right.body.is_none() {
+        return None;
+    }
+
+    let text_diff = TextDiff::from_lines(left_body, right_body);
+    let mut unified = String::new();
+    for change in text_diff.iter_all_changes() {
+        let sign = match change.tag() {
+            ChangeTag::Delete => "-",
+            ChangeTag::Insert => "+",
+            ChangeTag::Equal => " ",
+        };
+        unified.push_str(sign);
+        unified.push_str(change.as_str().unwrap_or(""));
+        if !change.as_str().unwrap_or("").ends_with('\n') {
+            unified.push('\n');
+        }
+        if unified.len() > MAX_DIFF_OUTPUT {
+            unified.truncate(MAX_DIFF_OUTPUT);
+            unified.push_str("\n... (truncated)\n");
+            break;
+        }
+    }
+
+    Some(BodyDiff {
+        left_size: left.body_size,
+        right_size: right.body_size,
+        unified_diff: unified,
     })
 }
 
@@ -257,6 +323,38 @@ fn detect_waf_diff(left: &ReplayResult, right: &ReplayResult) -> Option<WafDiff>
     })
 }
 
+/// Known WAF block page body patterns (case-insensitive matching)
+const WAF_BODY_PATTERNS: &[&str] = &[
+    // Generic block pages
+    "access denied",
+    "request blocked",
+    "forbidden by security policy",
+    // Cloudflare
+    "/cdn-cgi/challenge-platform/",
+    "attention required! | cloudflare",
+    "ray id:",
+    "cloudflare to restrict access",
+    // Akamai
+    "reference&#32;&#35;",
+    "access denied | akamai",
+    "akamaighost",
+    // AWS WAF
+    "request blocked by aws waf",
+    // Imperva / Incapsula
+    "incapsula incident id",
+    "powered by incapsula",
+    // ModSecurity
+    "mod_security",
+    "modsecurity",
+    // F5 / BIG-IP
+    "the requested url was rejected",
+    "support id:",
+    // Sucuri
+    "sucuri website firewall",
+    // Barracuda
+    "barracuda networks",
+];
+
 /// Check if a response indicates a WAF block
 fn is_waf_block(result: &ReplayResult) -> bool {
     // Status codes that typically indicate blocking
@@ -276,10 +374,20 @@ fn is_waf_block(result: &ReplayResult) -> bool {
         }
     }
 
+    // Check response body for WAF block page patterns
+    if let Some(ref body) = result.body {
+        let body_lower = body.to_lowercase();
+        for pattern in WAF_BODY_PATTERNS {
+            if body_lower.contains(pattern) {
+                return true;
+            }
+        }
+    }
+
     false
 }
 
-/// Extract WAF reason from headers
+/// Extract WAF reason from headers or body
 fn get_waf_reason(result: &ReplayResult) -> Option<String> {
     // Try common WAF reason headers
     let reason_headers = ["x-waf-rule", "x-waf-action", "x-blocked-by", "x-blocked"];
@@ -295,6 +403,16 @@ fn get_waf_reason(result: &ReplayResult) -> Option<String> {
         return Some(format!("HTTP {}", result.status));
     }
 
+    // Check body for WAF signatures
+    if let Some(ref body) = result.body {
+        let body_lower = body.to_lowercase();
+        for pattern in WAF_BODY_PATTERNS {
+            if body_lower.contains(pattern) {
+                return Some(format!("body match: {}", pattern));
+            }
+        }
+    }
+
     None
 }
 
@@ -303,6 +421,15 @@ mod tests {
     use super::*;
 
     fn make_result(index: usize, status: u16, headers: Vec<(&str, &str)>) -> ReplayResult {
+        make_result_with_body(index, status, headers, None)
+    }
+
+    fn make_result_with_body(
+        index: usize,
+        status: u16,
+        headers: Vec<(&str, &str)>,
+        body: Option<&str>,
+    ) -> ReplayResult {
         ReplayResult {
             request_index: index,
             method: "GET".to_string(),
@@ -312,7 +439,8 @@ mod tests {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            body_size: 0,
+            body: body.map(|s| s.to_string()),
+            body_size: body.map(|s| s.len()).unwrap_or(0),
             duration_ms: 100,
             expected_status: Some(200),
             status_match: status == 200,
@@ -354,5 +482,68 @@ mod tests {
         let waf = diff.waf_diff.unwrap();
         assert!(!waf.left_blocked);
         assert!(waf.right_blocked);
+    }
+
+    #[test]
+    fn test_body_diff_identical() {
+        let left = make_result_with_body(0, 200, vec![], Some("{\"ok\":true}"));
+        let right = make_result_with_body(0, 200, vec![], Some("{\"ok\":true}"));
+        assert!(diff_results(&left, &right).is_none());
+    }
+
+    #[test]
+    fn test_body_diff_different() {
+        let left = make_result_with_body(0, 200, vec![], Some("{\"ok\":true}"));
+        let right = make_result_with_body(0, 200, vec![], Some("{\"ok\":false}"));
+        let diff = diff_results(&left, &right).unwrap();
+        assert!(diff.body_diff.is_some());
+        let body = diff.body_diff.unwrap();
+        assert!(body.unified_diff.contains('-'));
+        assert!(body.unified_diff.contains('+'));
+    }
+
+    #[test]
+    fn test_body_diff_one_missing() {
+        let left = make_result_with_body(0, 200, vec![], Some("hello"));
+        let right = make_result_with_body(0, 200, vec![], None);
+        let diff = diff_results(&left, &right).unwrap();
+        assert!(diff.body_diff.is_some());
+    }
+
+    #[test]
+    fn test_waf_block_body_cloudflare() {
+        let result = make_result_with_body(
+            0,
+            200,
+            vec![],
+            Some("<html>Attention Required! | Cloudflare</html>"),
+        );
+        assert!(is_waf_block(&result));
+    }
+
+    #[test]
+    fn test_waf_block_body_generic() {
+        let result = make_result_with_body(
+            0,
+            200,
+            vec![],
+            Some("<h1>Access Denied</h1><p>Your request was blocked.</p>"),
+        );
+        assert!(is_waf_block(&result));
+    }
+
+    #[test]
+    fn test_waf_block_body_no_false_positive() {
+        let result = make_result_with_body(0, 200, vec![], Some("{\"status\":\"ok\",\"data\":[]}"));
+        assert!(!is_waf_block(&result));
+    }
+
+    #[test]
+    fn test_waf_reason_from_body() {
+        let result =
+            make_result_with_body(0, 200, vec![], Some("<html>Powered by Incapsula</html>"));
+        let reason = get_waf_reason(&result);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("incapsula"));
     }
 }

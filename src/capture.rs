@@ -37,10 +37,20 @@ impl Capture {
     }
 }
 
-/// Load a capture from a file
+/// Supported capture format versions
+const SUPPORTED_VERSIONS: &[&str] = &["1.0"];
+
+/// Load a capture from a file, validating the format version
 pub fn load_capture(path: &str) -> anyhow::Result<Capture> {
     let content = std::fs::read_to_string(path)?;
     let capture: Capture = serde_json::from_str(&content)?;
+    if !SUPPORTED_VERSIONS.contains(&capture.version.as_str()) {
+        anyhow::bail!(
+            "Unsupported capture format version '{}' (supported: {})",
+            capture.version,
+            SUPPORTED_VERSIONS.join(", ")
+        );
+    }
     Ok(capture)
 }
 
